@@ -2639,8 +2639,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				// Check if we have any content to process (text or tool uses)
 				const hasTextContent = assistantMessage.length > 0
 				const hasToolUses = this.assistantMessageContent.some((block) => block.type === "tool_use")
+				const hasReasoningDetails = reasoningDetails.length > 0
 
-				if (hasTextContent || hasToolUses) {
+				if (hasTextContent || hasToolUses || hasReasoningDetails) {
 					// Display grounding sources to the user if they exist
 					if (pendingGroundingSources.length > 0) {
 						const citationLinks = pendingGroundingSources.map((source, i) => `[${i + 1}](${source.url})`)
@@ -2661,11 +2662,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					// Build the assistant message content array
 					const assistantContent: Array<Anthropic.TextBlockParam | Anthropic.ToolUseBlockParam> = []
 
-					// Add text content if present
-					if (finalAssistantMessage) {
+					// Add text content if present, or if we have reasoning details that need a text block to be attached to
+					if (finalAssistantMessage || hasReasoningDetails) {
 						assistantContent.push({
 							type: "text" as const,
-							text: finalAssistantMessage,
+							text: finalAssistantMessage, // This will be empty string if !finalAssistantMessage, which is fine
 						})
 					}
 
