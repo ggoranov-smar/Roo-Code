@@ -65,7 +65,7 @@ import { ClineAskResponse } from "../../shared/WebviewMessage"
 import { defaultModeSlug, getModeBySlug, getGroupName } from "../../shared/modes"
 import { DiffStrategy, type ToolUse } from "../../shared/tools"
 import { EXPERIMENT_IDS, experiments } from "../../shared/experiments"
-import { getModelMaxOutputTokens } from "../../shared/api"
+import { getModelMaxOutputTokens, ProviderMessageMetadata } from "../../shared/api"
 
 // services
 import { UrlContentFetcher } from "../../services/browser/UrlContentFetcher"
@@ -647,66 +647,50 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	}
 
 	private async addToApiConversationHistory(message: Anthropic.MessageParam) {
-		// Capture the encrypted_content / thought signatures from the provider (e.g., OpenAI Responses API, Google GenAI) if present.
+		// Capture generation metadata (reasoning, thought signatures, etc.) from the provider if present.
 		// We only persist data reported by the current response body.
-		const handler = this.api as ApiHandler & {
-			getResponseId?: () => string | undefined
-			getEncryptedContent?: () => { encrypted_content: string; id?: string } | undefined
-			getThoughtSignature?: () => string | undefined
-		}
+		const metadata = this.api.getGenerationMetadata?.()
 
 		if (message.role === "assistant") {
-			const responseId = handler.getResponseId?.()
-			const reasoningData = handler.getEncryptedContent?.()
-			const thoughtSignature = handler.getThoughtSignature?.()
-
 			// Start from the original assistant message
 			const messageWithTs: any = {
 				...message,
-				...(responseId ? { id: responseId } : {}),
+				...(metadata?.openAiResponseId || metadata?.geminiResponseId
+					? { id: metadata.openAiResponseId || metadata.geminiResponseId }
+					: {}),
 				ts: Date.now(),
 			}
 
-			// If we have encrypted_content, embed it as the first content block on the assistant message.
-			// This keeps reasoning + assistant atomic for context management while still allowing providers
-			// to receive a separate reasoning item when we build the request.
-			if (reasoningData?.encrypted_content) {
-				const reasoningBlock = {
-					type: "reasoning",
-					summary: [] as any[],
-					encrypted_content: reasoningData.encrypted_content,
-					...(reasoningData.id ? { id: reasoningData.id } : {}),
-				}
-
-				if (typeof messageWithTs.content === "string") {
-					messageWithTs.content = [
-						reasoningBlock,
-						{ type: "text", text: messageWithTs.content } satisfies Anthropic.Messages.TextBlockParam,
-					]
-				} else if (Array.isArray(messageWithTs.content)) {
-					messageWithTs.content = [reasoningBlock, ...messageWithTs.content]
-				} else if (!messageWithTs.content) {
-					messageWithTs.content = [reasoningBlock]
-				}
-			}
-
-			// If we have a thought signature, append it as a dedicated content block
-			// so it can be round-tripped in api_history.json and re-sent on subsequent calls.
-			if (thoughtSignature) {
-				const thoughtSignatureBlock = {
-					type: "thoughtSignature",
-					thoughtSignature,
-				}
-
+			// If we have metadata, attach it to the text block(s) of the assistant message.
+			// This standardized approach avoids creating separate "virtual" blocks in the history.
+			if (metadata) {
+				// Normalize content to array for easier processing
 				if (typeof messageWithTs.content === "string") {
 					messageWithTs.content = [
 						{ type: "text", text: messageWithTs.content } satisfies Anthropic.Messages.TextBlockParam,
-						thoughtSignatureBlock,
 					]
-				} else if (Array.isArray(messageWithTs.content)) {
-					messageWithTs.content = [...messageWithTs.content, thoughtSignatureBlock]
-				} else if (!messageWithTs.content) {
-					messageWithTs.content = [thoughtSignatureBlock]
+				}
+
+				if (Array.isArray(messageWithTs.content)) {
+					// Attach metadata to the first text block we find, or create one if needed
+					let attached = false
+					for (const block of messageWithTs.content) {
+						if (block.type === "text") {
+							block.providerMetadata = metadata
+							attached = true
+							break
+						}
+					}
+
+					// If no text block existed (e.g. tool use only) but we have metadata to persist,
+					// create an empty text block to hold it.
+					if (!attached) {
+						messageWithTs.content.unshift({
+							type: "text",
+							text: "", // Empty text block just to hold metadata
+							providerMetadata: metadata,
+						})
+					}
 				}
 			}
 
@@ -3366,6 +3350,13 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	): Array<
 		Anthropic.Messages.MessageParam | { type: "reasoning"; encrypted_content: string; id?: string; summary?: any[] }
 	> {
+		// The clean history sent to the provider.
+		// Note: This type definition is a union because OpenAI Native (Responses API) supports a separate
+		// { type: "reasoning" } item for stateless continuity of encrypted reasoning. Other providers
+		// generally just expect standard Anthropic.Messages.MessageParam objects.
+		// The standardized `providerMetadata` approach attaches reasoning data to text blocks, which
+		// providers can then extract and format as needed (e.g. OpenAI Native provider extracts it back
+		// into a separate item in its `formatFullConversation` method).
 		type ReasoningItemForRequest = {
 			type: "reasoning"
 			encrypted_content: string
@@ -3376,38 +3367,28 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const cleanConversationHistory: (Anthropic.Messages.MessageParam | ReasoningItemForRequest)[] = []
 
 		for (const msg of messages) {
-			// Legacy path: standalone reasoning items stored as separate messages
+			// Legacy support: Handle standalone reasoning items from older history
 			if (msg.type === "reasoning" && msg.encrypted_content) {
 				cleanConversationHistory.push({
 					type: "reasoning",
-					summary: msg.summary,
+					summary: msg.summary || [],
 					encrypted_content: msg.encrypted_content!,
 					...(msg.id ? { id: msg.id } : {}),
 				})
 				continue
 			}
 
-			// Preferred path: assistant message with embedded reasoning as first content block
-			if (msg.role === "assistant") {
-				const rawContent = msg.content
-
-				const contentArray: Anthropic.Messages.ContentBlockParam[] = Array.isArray(rawContent)
-					? (rawContent as Anthropic.Messages.ContentBlockParam[])
-					: rawContent !== undefined
-						? ([
-								{ type: "text", text: rawContent } satisfies Anthropic.Messages.TextBlockParam,
-							] as Anthropic.Messages.ContentBlockParam[])
-						: []
-
-				const [first, ...rest] = contentArray
-
-				const hasEmbeddedReasoning =
-					first && (first as any).type === "reasoning" && typeof (first as any).encrypted_content === "string"
-
-				if (hasEmbeddedReasoning) {
-					const reasoningBlock = first as any
-
-					// Emit a separate reasoning item for the provider
+			// Legacy support: Handle embedded reasoning blocks from the transitional period
+			// (where reasoning was a block inside content with type="reasoning")
+			if (msg.role === "assistant" && Array.isArray(msg.content)) {
+				const firstBlock = msg.content[0]
+				if (
+					firstBlock &&
+					(firstBlock as any).type === "reasoning" &&
+					typeof (firstBlock as any).encrypted_content === "string"
+				) {
+					// Found legacy embedded reasoning block - emit as separate item
+					const reasoningBlock = firstBlock as any
 					cleanConversationHistory.push({
 						type: "reasoning",
 						summary: reasoningBlock.summary ?? [],
@@ -3415,27 +3396,21 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						...(reasoningBlock.id ? { id: reasoningBlock.id } : {}),
 					})
 
-					// Build assistant message without the embedded reasoning block
-					let assistantContent: Anthropic.Messages.MessageParam["content"]
-
-					if (rest.length === 0) {
-						assistantContent = ""
-					} else if (rest.length === 1 && rest[0].type === "text") {
-						assistantContent = (rest[0] as Anthropic.Messages.TextBlockParam).text
-					} else {
-						assistantContent = rest
+					// Add the rest of the message as the assistant message
+					const restOfContent = msg.content.slice(1)
+					if (restOfContent.length > 0) {
+						cleanConversationHistory.push({
+							role: "assistant",
+							content: restOfContent as Anthropic.Messages.ContentBlockParam[],
+						})
 					}
-
-					cleanConversationHistory.push({
-						role: "assistant",
-						content: assistantContent,
-					} satisfies Anthropic.Messages.MessageParam)
-
 					continue
 				}
 			}
 
-			// Default path for regular messages (no embedded reasoning)
+			// Standard path: Pass the message through.
+			// Metadata attached to text blocks (providerMetadata) is preserved in the object
+			// and will be handled by the specific provider's formatting logic.
 			if (msg.role) {
 				cleanConversationHistory.push({
 					role: msg.role,
